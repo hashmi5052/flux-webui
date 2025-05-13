@@ -10,7 +10,6 @@ import devicetorch
 
 # ========= Prompt Enhancements =========
 POSITIVE_PHRASES = "masterpiece, highly detailed, cinematic lighting, DSLR, bokeh, shallow depth of field, studio lighting, photo, realistic"
-NEGATIVE_PROMPT = ""  # Add negative prompts here if needed
 
 # ========= Utilities =========
 def read_prompt_file(file_path):
@@ -50,6 +49,7 @@ class QuantizedFluxTransformer2DModel(QuantizedDiffusersModel):
 
 dtype = torch.bfloat16
 device = devicetorch.get(torch)
+device = str(device)
 MAX_SEED = np.iinfo(np.int32).max
 selected = None
 run_index = 1
@@ -60,31 +60,37 @@ pipe = None
 def load_pipeline(checkpoint):
     global pipe, selected
 
-    if selected != checkpoint:
-        if checkpoint == "sayakpaul/FLUX.1-merged":
-            repo = "cocktailpeanut/xulf-d"
-            model_id = "cocktailpeanut/flux1-merged-q8"
-        else:
-            repo = "cocktailpeanut/xulf-s"
-            model_id = "cocktailpeanut/flux1-schnell-q8"
+    if selected == checkpoint and pipe is not None:
+        print("Pipeline already loaded, skipping reinitialization.")
+        return
 
-        print(f"Loading transformer: {model_id}")
-        transformer = QuantizedFluxTransformer2DModel.from_pretrained(model_id, cache_dir="models")
-        transformer.to(device=device, dtype=dtype)
+    if checkpoint == "sayakpaul/FLUX.1-merged":
+        repo = "cocktailpeanut/xulf-d"
+        model_id = "cocktailpeanut/flux1-merged-q8" if device != "mps" else "cocktailpeanut/flux1-merged-qint8"
+    else:
+        repo = "cocktailpeanut/xulf-s"
+        model_id = "cocktailpeanut/flux1-schnell-q8" if device != "mps" else "cocktailpeanut/flux1-schnell-qint8"
 
-        print("Loading pipeline...")
-        pipe = FluxPipeline.from_pretrained(repo, transformer=None, torch_dtype=dtype, cache_dir="models")
-        pipe.transformer = transformer
+    print(f"Loading quantized transformer from: {model_id}")
+    transformer = QuantizedFluxTransformer2DModel.from_pretrained(model_id, cache_dir="models")
+    transformer.to(device=device, dtype=dtype)
+
+    print(f"Loading pipeline from repo: {repo}")
+    pipe = FluxPipeline.from_pretrained(repo, transformer=None, torch_dtype=dtype, cache_dir="models")
+    pipe.transformer = transformer
+
+    pipe.enable_attention_slicing()
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
+
+    if device == "cuda":
+        print("Using sequential CPU offload for CUDA...")
+        pipe.enable_sequential_cpu_offload()
+    else:
         pipe.to(device)
 
-        # ========= CUDA Memory Optimization =========
-        pipe.enable_attention_slicing()
-        pipe.enable_model_cpu_offload()
-        pipe.vae.enable_slicing()
-        pipe.vae.enable_tiling()
-
-        selected = checkpoint
-        print("Pipeline loaded!")
+    selected = checkpoint
+    print("Pipeline loaded and ready.")
 
 # ========= Generate from File =========
 def generate_from_excel(file, checkpoint, width, height, num_images_per_prompt, num_inference_steps, guidance_scale, progress=gr.Progress(track_tqdm=False)):
@@ -101,7 +107,6 @@ def generate_from_excel(file, checkpoint, width, height, num_images_per_prompt, 
         return
 
     load_pipeline(checkpoint)
-
     run_folder = f"output/run-{run_index:02d}"
     os.makedirs(run_folder, exist_ok=True)
 
@@ -113,20 +118,28 @@ def generate_from_excel(file, checkpoint, width, height, num_images_per_prompt, 
         prompt = f"{POSITIVE_PHRASES}, {row['prompt']}"
         image_path = f"{run_folder}/{image_number}.png"
 
-        generator = torch.Generator().manual_seed(42)
-        images = pipe(
-            prompt=prompt,
-            width=width,
-            height=height,
-            num_inference_steps=num_inference_steps,
-            generator=generator,
-            num_images_per_prompt=num_images_per_prompt,
-            guidance_scale=guidance_scale,
-            negative_prompt=NEGATIVE_PROMPT
-        ).images
+        generator = torch.Generator(device=device).manual_seed(42)
+
+        torch.cuda.empty_cache()
+        devicetorch.empty_cache(torch)
+
+        try:
+            images = pipe(
+                prompt=prompt,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                generator=generator,
+                num_images_per_prompt=num_images_per_prompt,
+                guidance_scale=guidance_scale,
+            ).images
+        except Exception as e:
+            yield None, f"Error during inference: {e}", f"{int((i + 1) / len(df) * 100)}% completed"
+            continue
 
         images[0].save(image_path)
-        torch.cuda.empty_cache()  # ✅ Clear CUDA memory
+        torch.cuda.empty_cache()
+        devicetorch.empty_cache(torch)
 
         percent = int(((i + 1) / len(df)) * 100)
         yield images[0], f"{image_number}", f"{percent}% completed"
